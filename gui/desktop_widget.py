@@ -55,12 +55,12 @@ class ScreentimeDesktopWidget(QWidget):
         self._always_on_top: bool = False
 
         # Frameless, translucent glass window configuration
-        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.SubWindow)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setStyleSheet(WIDGET_STYLE)
 
         self._build_ui()
         self._load_geometry()
+        self._apply_window_layering()
 
         # High-frequency timer for smooth clock hand animation & digital tick
         self.clock_timer = QTimer(self)
@@ -287,18 +287,34 @@ class ScreentimeDesktopWidget(QWidget):
         self.adjustSize()
         self._save_geometry()
 
-    def _toggle_always_on_top(self) -> None:
-        """Toggle always-on-top window layering."""
-        self._always_on_top = not self._always_on_top
-        flags = self.windowFlags()
+    def _apply_window_layering(self) -> None:
+        """Apply window layering flags for background desktop vs floating on top.
+
+        In desktop background mode, applies Qt.WindowStaysOnBottomHint and Qt.Tool
+        (_NET_WM_STATE_BELOW, _NET_WM_STATE_SKIP_TASKBAR, _NET_WM_STATE_SKIP_PAGER),
+        pinning the widget directly above the desktop wallpaper and underneath all
+        normal application windows (browsers, IDEs, terminals). In always-on-top mode,
+        applies Qt.WindowStaysOnTopHint.
+        """
+        base_flags = Qt.WindowType.FramelessWindowHint
         if self._always_on_top:
-            flags |= Qt.WindowType.WindowStaysOnTopHint
+            self.setWindowFlags(base_flags | Qt.WindowType.WindowStaysOnTopHint)
             self.btn_pin.setStyleSheet(f"color: {ACCENT_CYAN};")
+            self.btn_pin.setToolTip("Unpin from Top (Send to Desktop Background)")
+            self.show()
+            self.raise_()
         else:
-            flags &= ~Qt.WindowType.WindowStaysOnTopHint
+            self.setWindowFlags(base_flags | Qt.WindowType.WindowStaysOnBottomHint)
             self.btn_pin.setStyleSheet(f"color: {TEXT_MUTED};")
-        self.setWindowFlags(flags)
-        self.show()
+            self.btn_pin.setToolTip("Pin to Top (Float above all windows)")
+            self.show()
+            self.lower()
+
+    def _toggle_always_on_top(self) -> None:
+        """Toggle floating on top vs background desktop widget behavior."""
+        self._always_on_top = not self._always_on_top
+        self._apply_window_layering()
+        self._save_geometry()
 
     def _toggle_dial_mode(self) -> None:
         """Toggle clock dial between timeline intervals and cumulative gauge."""
@@ -339,6 +355,8 @@ class ScreentimeDesktopWidget(QWidget):
             event: Mouse release event.
         """
         self._drag_pos = None
+        if not self._always_on_top:
+            self.lower()
         self._save_geometry()
         event.accept()
 
@@ -409,6 +427,7 @@ class ScreentimeDesktopWidget(QWidget):
             x = data.get("x", 60)
             y = data.get("y", 60)
             self.move(x, y)
+            self._always_on_top = data.get("always_on_top", False)
             if data.get("is_expanded", False):
                 self._toggle_expand()
             if not data.get("timeline_mode", True):
