@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import time
 from typing import Any
 
 from config import CONFIG_FILE, HISTORY_FILE, config
@@ -172,11 +173,162 @@ class ScreentimeTracker:
         self._refresh_system_sessions()
         self._load_persisted_state()
 
-    def _refresh_system_sessions(self) -> None:
-        """Parse `last -F -w` and system commands to extract current and previous sessions."""
-        now = datetime.now()
-        today_date = now.date()
+    def _get_journal_sessions(
+        self, target_user: str | None = None, max_boots: int = 10
+    ) -> tuple[list[SessionRecord], SessionRecord | None]:
+        """Extract monotonic-calibrated sessions from systemd journal to prevent RTC skew.
 
+        Hardware RTC clock drift, dual-boot Windows/Linux localtime mismatches, and
+        network time steps (NTP) corrupt wall-clock differences recorded in wtmp/last.
+        Systemd journal records monotonic timestamps (`__MONOTONIC_TIMESTAMP`) alongside
+        realtime timestamps. Monotonic duration is strictly immune to RTC adjustments.
+        The accurate wall-clock start time is computed as:
+        `wall_start = wall_end - timedelta(seconds=monotonic_duration)`.
+
+        Args:
+            target_user: Linux username to inspect. Defaults to current login user.
+            max_boots: Maximum number of prior boot cycles to inspect. Defaults to 10.
+
+        Returns:
+            tuple[list[SessionRecord], SessionRecord | None]: List of completed session
+                records, and an optional current session record if discovered.
+        """
+        if not target_user:
+            target_user = os.getenv("USER", "ameya")
+
+        today_date = datetime.now().date()
+        completed_records: list[SessionRecord] = []
+        current_record: SessionRecord | None = None
+
+        try:
+            boots_raw = subprocess.check_output(
+                ["journalctl", "--list-boots"], stderr=subprocess.DEVNULL
+            ).decode("utf-8", errors="ignore")
+            available_boots: list[int] = []
+            for line in boots_raw.splitlines():
+                parts = line.strip().split()
+                if parts and parts[0].lstrip("-+").isdigit():
+                    available_boots.append(int(parts[0]))
+        except Exception:
+            return completed_records, current_record
+
+        start_pattern = rf"Started\s+(session-[a-zA-Z0-9]+\.scope)\s+-\s+Session\s+[a-zA-Z0-9]+\s+of\s+User\s+{target_user}"
+        stop_pattern = rf"Stopped\s+(session-[a-zA-Z0-9]+\.scope)\s+-\s+Session\s+[a-zA-Z0-9]+\s+of\s+User\s+{target_user}"
+
+        active_scopes: set[str] = set()
+        try:
+            loginctl_out = subprocess.check_output(
+                ["loginctl", "list-sessions", "--no-legend"], stderr=subprocess.DEVNULL
+            ).decode("utf-8", errors="ignore")
+            for line in loginctl_out.splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and parts[2] == target_user:
+                    active_scopes.add(f"session-{parts[0]}.scope")
+        except Exception:
+            pass
+
+        # Inspect boot 0 first, then -1, -2, etc.
+        prior_boots = [b for b in sorted(available_boots, reverse=True) if b < 0][:max_boots]
+        boot_list = [0] + prior_boots
+
+        for boot_offset in boot_list:
+            cmd = ["journalctl", f"-b{boot_offset}", "-o", "json", "-u", "session-*.scope"]
+            try:
+                out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode(
+                    "utf-8", errors="ignore"
+                )
+            except Exception:
+                continue
+
+            lines = [l for l in out.splitlines() if l.strip()]
+            if not lines:
+                continue
+
+            scope_events: dict[str, dict[str, Any]] = {}
+            for line in lines:
+                try:
+                    entry = json.loads(line)
+                except Exception:
+                    continue
+
+                unit = entry.get("UNIT") or entry.get("_SYSTEMD_UNIT")
+                msg = entry.get("MESSAGE", "")
+                mono_us = entry.get("__MONOTONIC_TIMESTAMP")
+                real_us = entry.get("__REALTIME_TIMESTAMP")
+
+                if not unit or not mono_us:
+                    continue
+
+                if unit not in scope_events:
+                    if re.search(start_pattern, msg):
+                        scope_events[unit] = {
+                            "start_mono_us": int(mono_us),
+                            "start_real_us": int(real_us) if real_us else None,
+                            "end_mono_us": int(mono_us),
+                            "end_real_us": int(real_us) if real_us else None,
+                            "stopped": False,
+                            "boot_offset": boot_offset,
+                            "unit": unit,
+                        }
+                else:
+                    scope_events[unit]["end_mono_us"] = int(mono_us)
+                    if real_us:
+                        scope_events[unit]["end_real_us"] = int(real_us)
+                    if re.search(stop_pattern, msg) or "Deactivated successfully" in msg:
+                        scope_events[unit]["stopped"] = True
+
+            for unit, data in scope_events.items():
+                start_mono = data["start_mono_us"] / 1_000_000.0
+
+                if boot_offset == 0 and unit in active_scopes and not data["stopped"]:
+                    cur_mono = time.monotonic()
+                    dur = max(0.0, cur_mono - start_mono)
+                    now_dt = datetime.now()
+                    calc_start = now_dt - timedelta(seconds=dur)
+                    current_record = SessionRecord(
+                        start=calc_start,
+                        end=None,
+                        duration_seconds=dur,
+                        tty_or_display=":0",
+                        is_current=True,
+                    )
+                    continue
+
+                end_mono = (data["end_mono_us"] or data["start_mono_us"]) / 1_000_000.0
+                duration = max(0.0, end_mono - start_mono)
+                # Ignore trivial sessions under 60s
+                if duration < 60.0:
+                    continue
+
+                end_real = (data["end_real_us"] or data["start_real_us"]) / 1_000_000.0
+                end_dt = datetime.fromtimestamp(end_real)
+                calc_start = end_dt - timedelta(seconds=duration)
+
+                completed_records.append(
+                    SessionRecord(
+                        start=calc_start,
+                        end=end_dt,
+                        duration_seconds=duration,
+                        tty_or_display=":0",
+                        is_current=False,
+                    )
+                )
+
+            # Once we find completed session(s) in a prior boot that started before today,
+            # we have the latest prior login session and can stop searching older boots.
+            if completed_records and boot_offset < 0:
+                has_prior_day = any(r.start.date() < today_date for r in completed_records)
+                if has_prior_day:
+                    break
+
+        return completed_records, current_record
+
+    def _parse_wtmp_sessions(self) -> list[SessionRecord]:
+        """Parse wtmp records via `last -F -w` as fallback with sanity checks.
+
+        Returns:
+            list[SessionRecord]: Parsed session records sorted chronologically.
+        """
         try:
             raw_output = subprocess.check_output(
                 ["last", "-F", "-w"], stderr=subprocess.DEVNULL
@@ -185,11 +337,6 @@ class ScreentimeTracker:
             raw_output = ""
 
         parsed_sessions: list[SessionRecord] = []
-
-        # Example line formats:
-        # ameya    tty7  :0  Sat Oct 31 19:04:27 2026   gone - no logout
-        # ameya    tty7  :0  Mon Oct 26 04:09:23 2026 - Mon Oct 26 11:08:12 2026 (06:58)
-        # ameya    tty7  :0  Sat Oct 24 22:12:31 2026 - Sun Oct 25 01:03:42 2026 (02:51)
         date_pattern = r"([A-Z][a-z]{2}\s+[A-Z][a-z]{2}\s+\d+\s+\d{2}:\d{2}:\d{2}\s+\d{4})"
         regex = re.compile(
             rf"^\s*([a-zA-Z0-9_\-]+)\s+(\S+)\s+(\S+)\s+{date_pattern}\s*(?:-|\s+gone\s+-|\s+still\s+logged\s+in)\s*({date_pattern}|crash|down|still logged in|no logout)?(?:\s+\((?:(\d+)\+)?(\d{2}):(\d{2})\))?"
@@ -232,10 +379,12 @@ class ScreentimeTracker:
                 d = int(days_str) if days_str else 0
                 h = int(hours_str) if hours_str else 0
                 m = int(mins_str) if mins_str else 0
-                duration_sec = (d * 86400) + (h * 3600) + (m * 60)
+                duration_sec = float((d * 86400) + (h * 3600) + (m * 60))
             elif end_dt and end_dt >= start_dt:
                 duration_sec = (end_dt - start_dt).total_seconds()
 
+            # Guard against negative durations or corrupted records
+            duration_sec = max(0.0, duration_sec)
             is_current = end_dt is None and ("still logged in" in line or "gone - no logout" in line)
 
             parsed_sessions.append(
@@ -248,8 +397,65 @@ class ScreentimeTracker:
                 )
             )
 
-        if not parsed_sessions:
-            # Fallback to boot time
+        return parsed_sessions
+
+    def _refresh_system_sessions(self) -> None:
+        """Refresh system login sessions using monotonic journal telemetry and wtmp fallback."""
+        now = datetime.now()
+        today_date = now.date()
+
+        # 1. Primary: Query monotonic journal sessions (immune to RTC offsets & clock jumps)
+        journal_completed, journal_current = self._get_journal_sessions()
+
+        if journal_current:
+            self.current_session = journal_current
+
+        if journal_completed:
+            journal_completed.sort(key=lambda s: s.start, reverse=True)
+            self.last_session = journal_completed[0]
+            self.today_completed_sessions = [
+                s for s in journal_completed if s.start.date() == today_date and s.duration_seconds > 0
+            ]
+
+        # 2. If journal didn't provide current or last session, supplement from wtmp records
+        if not self.current_session or not self.last_session:
+            wtmp_sessions = self._parse_wtmp_sessions()
+            if wtmp_sessions:
+                wtmp_sessions.sort(key=lambda s: s.start, reverse=True)
+
+                if not self.current_session:
+                    first = wtmp_sessions[0]
+                    if first.is_current or (now - first.start).total_seconds() < 86400:
+                        first.is_current = True
+                        self.current_session = first
+                        remaining = wtmp_sessions[1:]
+                    else:
+                        self.current_session = SessionRecord(
+                            start=now - timedelta(minutes=10),
+                            end=None,
+                            duration_seconds=600.0,
+                            tty_or_display=":0",
+                            is_current=True,
+                        )
+                        remaining = wtmp_sessions
+                else:
+                    remaining = wtmp_sessions
+
+                if not self.last_session:
+                    for s in remaining:
+                        if not s.is_current and s.duration_seconds > 60:
+                            self.last_session = s
+                            break
+                    if not self.last_session and remaining:
+                        self.last_session = remaining[0]
+
+                if not self.today_completed_sessions:
+                    self.today_completed_sessions = [
+                        s for s in remaining if s.start.date() == today_date and s.duration_seconds > 0
+                    ]
+
+        # 3. Final fallback if system has zero records
+        if not self.current_session:
             boot_time = datetime.now() - timedelta(minutes=15)
             self.current_session = SessionRecord(
                 start=boot_time,
@@ -258,6 +464,8 @@ class ScreentimeTracker:
                 tty_or_display=":0",
                 is_current=True,
             )
+        if not self.last_session:
+            boot_time = datetime.now() - timedelta(minutes=15)
             self.last_session = SessionRecord(
                 start=boot_time - timedelta(hours=6),
                 end=boot_time - timedelta(hours=2),
@@ -265,41 +473,6 @@ class ScreentimeTracker:
                 tty_or_display=":0",
                 is_current=False,
             )
-            return
-
-        # Sort sessions by start datetime descending
-        parsed_sessions.sort(key=lambda s: s.start, reverse=True)
-
-        # 1. First record is current session (or most recent active)
-        first = parsed_sessions[0]
-        if first.is_current or (now - first.start).total_seconds() < 86400:
-            first.is_current = True
-            self.current_session = first
-            remaining = parsed_sessions[1:]
-        else:
-            self.current_session = SessionRecord(
-                start=now - timedelta(minutes=10),
-                end=None,
-                duration_seconds=600.0,
-                tty_or_display=":0",
-                is_current=True,
-            )
-            remaining = parsed_sessions
-
-        # 2. Previous session is the first non-current completed session
-        self.last_session = None
-        for s in remaining:
-            if not s.is_current and s.duration_seconds > 60:
-                self.last_session = s
-                break
-
-        if not self.last_session and remaining:
-            self.last_session = remaining[0]
-
-        # 3. Identify completed sessions from today
-        self.today_completed_sessions = [
-            s for s in remaining if s.start.date() == today_date and s.duration_seconds > 0
-        ]
 
     def _load_persisted_state(self) -> None:
         """Load persistent history from JSON file."""
