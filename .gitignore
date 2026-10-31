@@ -1,0 +1,20 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+
+# System / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Local data (transient)
+data/screentime_history.json
+data/widget_config.json
