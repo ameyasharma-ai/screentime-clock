@@ -287,6 +287,68 @@ class ScreentimeDesktopWidget(QWidget):
         self.adjustSize()
         self._save_geometry()
 
+    def showEvent(self, event: Any) -> None:
+        """Handle widget show event to guarantee taskbar exclusion.
+
+        Args:
+            event: QShowEvent instance dispatched on display.
+        """
+        super().showEvent(event)
+        self._ensure_skip_taskbar()
+
+    def _ensure_skip_taskbar(self) -> None:
+        """Exclude widget window from system taskbars and pagers via X11 atoms.
+
+        Directly dispatches EWMH ClientMessage events for _NET_WM_STATE_SKIP_TASKBAR
+        and _NET_WM_STATE_SKIP_PAGER to guarantee compatibility across window managers
+        including xfwm4, Marco, and Mutter.
+        """
+        try:
+            import ctypes
+            lib_x11 = ctypes.cdll.LoadLibrary("libX11.so.6")
+            display = lib_x11.XOpenDisplay(None)
+            if not display:
+                return
+
+            wid = int(self.winId())
+            root = lib_x11.XDefaultRootWindow(display)
+            net_wm_state = lib_x11.XInternAtom(display, b"_NET_WM_STATE", False)
+            skip_taskbar = lib_x11.XInternAtom(display, b"_NET_WM_STATE_SKIP_TASKBAR", False)
+            skip_pager = lib_x11.XInternAtom(display, b"_NET_WM_STATE_SKIP_PAGER", False)
+
+            class _XClientMessageEvent(ctypes.Structure):
+                _fields_ = [
+                    ("type", ctypes.c_int),
+                    ("serial", ctypes.c_ulong),
+                    ("send_event", ctypes.c_int),
+                    ("display", ctypes.c_void_p),
+                    ("window", ctypes.c_ulong),
+                    ("message_type", ctypes.c_ulong),
+                    ("format", ctypes.c_int),
+                    ("data", ctypes.c_long * 5),
+                ]
+
+            for atom in (skip_taskbar, skip_pager):
+                msg = _XClientMessageEvent()
+                msg.type = 33  # ClientMessage
+                msg.send_event = 1
+                msg.display = display
+                msg.window = wid
+                msg.message_type = net_wm_state
+                msg.format = 32
+                msg.data[0] = 1  # _NET_WM_STATE_ADD
+                msg.data[1] = atom
+                msg.data[2] = 0
+                msg.data[3] = 1  # Normal client indication
+                msg.data[4] = 0
+                event_mask = (1 << 19) | (1 << 20)  # SubstructureRedirectMask | SubstructureNotifyMask
+                lib_x11.XSendEvent(display, root, False, event_mask, ctypes.byref(msg))
+
+            lib_x11.XFlush(display)
+            lib_x11.XCloseDisplay(display)
+        except Exception:
+            pass
+
     def _apply_window_layering(self) -> None:
         """Apply window layering flags for background desktop vs floating on top.
 
@@ -296,7 +358,7 @@ class ScreentimeDesktopWidget(QWidget):
         normal application windows (browsers, IDEs, terminals). In always-on-top mode,
         applies Qt.WindowStaysOnTopHint.
         """
-        base_flags = Qt.WindowType.FramelessWindowHint
+        base_flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool
         if self._always_on_top:
             self.setWindowFlags(base_flags | Qt.WindowType.WindowStaysOnTopHint)
             self.btn_pin.setStyleSheet(f"color: {ACCENT_CYAN};")
@@ -309,6 +371,7 @@ class ScreentimeDesktopWidget(QWidget):
             self.btn_pin.setToolTip("Pin to Top (Float above all windows)")
             self.show()
             self.lower()
+        self._ensure_skip_taskbar()
 
     def _toggle_always_on_top(self) -> None:
         """Toggle floating on top vs background desktop widget behavior."""

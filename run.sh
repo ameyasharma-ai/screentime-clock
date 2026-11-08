@@ -25,4 +25,12 @@ while ! xset q >/dev/null 2>&1; do
     fi
 done
 
+# Single-instance lock protection to guarantee only one widget instance can ever run
+LOCK_FILE="${XDG_RUNTIME_DIR:-/tmp}/screentime-clock.lock"
+exec 200>"$LOCK_FILE"
+if ! flock -n 200; then
+    echo "24H Screentime Clock is already running. Exiting cleanly."
+    exit 0
+fi
+
 exec "$SCRIPT_DIR/.venv/bin/python" "$SCRIPT_DIR/main.py" "$@"
