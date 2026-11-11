@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMenu,
     QPushButton,
+    QSizeGrip,
     QVBoxLayout,
     QWidget,
 )
@@ -224,7 +225,21 @@ class ScreentimeDesktopWidget(QWidget):
         self.expandable_section.setVisible(False)
         self.container_layout.addWidget(self.expandable_section)
 
+        # Bottom resize grip bar
+        grip_layout = QHBoxLayout()
+        grip_layout.setContentsMargins(0, 0, 0, 0)
+        grip_layout.addStretch()
+        self.size_grip = QSizeGrip(self)
+        self.size_grip.setFixedSize(16, 16)
+        self.size_grip.setStyleSheet(
+            f"QSizeGrip {{ image: none; background: transparent; width: 16px; height: 16px; }} "
+            f"QSizeGrip:hover {{ background-color: rgba(0, 240, 255, 0.2); border-radius: 3px; }}"
+        )
+        grip_layout.addWidget(self.size_grip)
+        self.container_layout.addLayout(grip_layout)
+
         self.root_layout.addWidget(self.container)
+        self.setMinimumSize(280, 320)
 
     def _update_display(self) -> None:
         """Update live screentime metrics, analog dial, and HUD badges."""
@@ -459,10 +474,12 @@ class ScreentimeDesktopWidget(QWidget):
         menu.exec(event.globalPos())
 
     def _save_geometry(self) -> None:
-        """Persist widget screen coordinates and expanded state to JSON."""
+        """Persist widget screen coordinates, dimensions, and expanded state to JSON."""
         data = {
             "x": self.x(),
             "y": self.y(),
+            "width": self.width(),
+            "height": self.height(),
             "is_expanded": self._is_expanded,
             "always_on_top": self._always_on_top,
             "timeline_mode": self.clock_dial.show_timeline_mode,
@@ -475,7 +492,7 @@ class ScreentimeDesktopWidget(QWidget):
             pass
 
     def _load_geometry(self) -> None:
-        """Restore saved widget position from JSON."""
+        """Restore saved widget position and dimensions from JSON."""
         if not CONFIG_FILE.exists():
             # Default to top-left or right side of screen
             screen = QApplication.primaryScreen()
@@ -490,6 +507,10 @@ class ScreentimeDesktopWidget(QWidget):
             x = data.get("x", 60)
             y = data.get("y", 60)
             self.move(x, y)
+            w = data.get("width")
+            h = data.get("height")
+            if w and h:
+                self.resize(w, h)
             self._always_on_top = data.get("always_on_top", False)
             if data.get("is_expanded", False):
                 self._toggle_expand()
