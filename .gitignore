@@ -18,3 +18,11 @@ ENV/
 # Local data (transient)
 data/screentime_history.json
 data/widget_config.json
+
+# Security Safeguards
+.env
+.env.*
+*.key
+*.pem
+*service_account*.json
+*credentials*.json
